@@ -20,32 +20,60 @@ from utils.convert_to_executorch import (
 
 
 def ptq_model(args, model, model_args=None):
-    transformers.set_seed(args.seed)
-    model.eval()
+    """
+    Apply Post-Training Quantization (PTQ), rotations, and optional Hadamard-based enhancements 
+    to the given LLaMA model based on SpinQuant settings.
 
-    # Rotate the weights
+    This function handles:
+    - Optional rotation of model weights (e.g., R1–R4 in SpinQuant)
+    - GPTQ or RTN weight quantization
+    - Activation quantization (A, V projections)
+    - Hadamard transformations for down_proj layers
+    - Executorch export
+
+    Args:
+        args: Namespace object containing quantization/rotation configuration.
+        model: The pre-loaded LLaMA model to modify.
+        model_args: Optional config with model metadata like input_model path.
+
+    Returns:
+        The modified model with rotations and quantization applied.
+    """
+
+    # Fix seed for reproducibility
+    transformers.set_seed(args.seed)
+    model.eval()                        # set mode to evaluation mode
+
+    # ----------------------
+    # Optional: Apply weight rotations (R1–R4) and fuse LayerNorms
+    # ----------------------
     if args.rotate:
-        fuse_norm_utils.fuse_layer_norms(model)
-        rotation_utils.rotate_model(model, args)
+        fuse_norm_utils.fuse_layer_norms(model)                                 # Fuse LayerNorms into linear layers
+        rotation_utils.rotate_model(model, args)                                # Inject and apply R1 and R2
         utils.cleanup_memory(verbos=True)
 
-        quant_utils.add_actquant(model)  # Add Activation Wrapper to the model
-        qlayers = quant_utils.find_qlayers(model)
+        quant_utils.add_actquant(model)                                         # Add Activation Wrapper to the model
+        qlayers = quant_utils.find_qlayers(model)                               # Find all quantized layers in the model
+        
+        
         for name in qlayers:
-            if "down_proj" in name:
+
+            #Check if downward projection available in layer names then apply R4
+            if "down_proj" in name:                 
                 had_K, K = hadamard_utils.get_hadK(model.config.intermediate_size)
-                qlayers[name].online_full_had = True
+                qlayers[name].online_full_had = True                            # perform online hadamard transform for R4
                 qlayers[name].had_K = had_K
                 qlayers[name].K = K
                 qlayers[name].fp32_had = args.fp32_had
     else:
+        # Add Activation Wrapper to the model as the rest of the code assumes it is present
         quant_utils.add_actquant(
             model
-        )  # Add Activation Wrapper to the model as the rest of the code assumes it is present
-
+        )  
+     # Weight Quantization (W)
     if args.w_bits < 16:
         save_dict = {}
-        if args.load_qmodel_path:  # Load Quantized Rotated Model
+        if args.load_qmodel_path:                                               # Load Quantized Rotated Model
             assert args.rotate, "Model should be rotated to load a quantized model!"
             assert (
                 not args.save_qmodel_path
@@ -55,6 +83,8 @@ def ptq_model(args, model, model_args=None):
             model.load_state_dict(save_dict["model"])
 
         elif not args.w_rtn:  # GPTQ Weight Quantization
+
+            # Use WikiText2 as calibration data for GPTQ
             trainloader = data_utils.get_wikitext2(
                 nsamples=args.nsamples,
                 seed=args.seed,
@@ -76,9 +106,12 @@ def ptq_model(args, model, model_args=None):
         else:  # RTN Weight Quantization
             quantizers = gptq_utils.rtn_fwrd(model, "cuda", args)
             save_dict["w_quantizers"] = quantizers
-
+        
+        # Save the quantized model
         if args.save_qmodel_path:
             save_dict["model"] = model.state_dict()
+
+            # special export for Executorch
             if args.export_to_et:
                 save_dict = write_model_llama(
                     model.state_dict(), model.config, num_shards=1
@@ -89,8 +122,10 @@ def ptq_model(args, model, model_args=None):
             torch.save(save_dict, args.save_qmodel_path)
 
     # Add Input Quantization
+    # Activation Quantization (A, V)
     if args.a_bits < 16 or args.v_bits < 16:
         qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        # Determine down_proj grouping strategy
         down_proj_groupsize = -1
         if args.a_groupsize > 0:
             down_proj_groupsize = utils.llama_down_proj_groupsize(
@@ -98,6 +133,7 @@ def ptq_model(args, model, model_args=None):
             )
 
         for name in qlayers:
+            # Defaults for A quantization
             layer_input_bits = args.a_bits
             layer_groupsize = args.a_groupsize
             layer_a_sym = not (args.a_asym)
@@ -106,7 +142,9 @@ def ptq_model(args, model, model_args=None):
             num_heads = model.config.num_attention_heads
             model_dim = model.config.hidden_size
             head_dim = model_dim // num_heads
+            
 
+            # Quantize V projection differently if requested
             if "v_proj" in name and args.v_bits < 16:  # Set the v_proj precision
                 v_groupsize = head_dim
                 qlayers[name].out_quantizer.configure(
@@ -127,6 +165,8 @@ def ptq_model(args, model, model_args=None):
                     layer_input_bits = 8
                 layer_groupsize = down_proj_groupsize
 
+
+            # Configure the input quantizer
             qlayers[name].quantizer.configure(
                 bits=layer_input_bits,
                 groupsize=layer_groupsize,
@@ -134,6 +174,7 @@ def ptq_model(args, model, model_args=None):
                 clip_ratio=layer_a_clip,
             )
 
+    # K Projection Quantization (Optional, after RoPE)
     if args.k_bits < 16:
         if args.k_pre_rope:
             raise NotImplementedError("Pre-RoPE quantization is not supported yet!")
@@ -146,6 +187,7 @@ def ptq_model(args, model, model_args=None):
                 "k_sym": not (args.k_asym),
                 "k_clip_ratio": args.k_clip_ratio,
             }
+            # Wrap K projection with quantization post-RoPE
             for layer in layers:
                 rotation_utils.add_qk_rotation_wrapper_after_function_call_in_forward(
                     layer.self_attn,

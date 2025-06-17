@@ -53,51 +53,165 @@ def get_orthogonal_matrix(size, mode, device="cuda"):
 
 
 def rotate_embeddings(model, R1: torch.Tensor) -> None:
-    # Rotate the embeddings.
+    """
+    Applies a rotation (R1) to the token embedding matrix of the model.
+
+    This is part of SpinQuant's preprocessing, where a learned or predefined
+    rotation matrix R1 is applied to the input embeddings to improve quantization performance.
+
+    Args:
+        model: The LLaMA model whose embeddings will be rotated.
+        R1 (torch.Tensor): A rotation matrix of shape [d, d], where d is the embedding dimension.
+    """
+    # Iterate over embedding matrices — here, only 'embed_tokens' is considered.
     for W in [model.model.embed_tokens]:
+        # Save the original data type (e.g., float16 or bfloat16)
         dtype = W.weight.data.dtype
+
+        # Move the embedding weights to CUDA and cast to float64 for better numerical precision
         W_ = W.weight.data.to(device="cuda", dtype=torch.float64)
-        W.weight.data = torch.matmul(W_, R1).to(device="cpu", dtype=dtype)
+
+        # Apply rotation: new_embeddings = W_original @ R1
+        rotated = torch.matmul(W_, R1)
+
+        # Move rotated weights back to CPU and original dtype
+        W.weight.data = rotated.to(device="cpu", dtype=dtype)
 
 
 def rotate_attention_inputs(layer, R1) -> None:
-    # Rotate the WQ, WK and WV matrices of the self-attention layer.
+    """
+    Applies a rotation matrix (R1) to the input projection matrices (Q, K, V)
+    of the self-attention mechanism in a transformer layer.
+
+    This is part of SpinQuant's preprocessing phase where rotation (R1)
+    is applied to attention input weights to structure the input feature space
+    in a way that is more quantization-friendly.
+
+    Args:
+        layer: A single transformer block/layer (e.g., LLaMA block) containing a `self_attn` module.
+        R1 (torch.Tensor): Rotation matrix of shape [d, d], where d is the model's hidden size.
+    """
+    # Apply R1 to each of the attention input projections: W_Q, W_K, W_V
     for W in [layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj]:
+        # Save the original data type (e.g., float16 or bfloat16)
         dtype = W.weight.dtype
+
+        # Move weight to CUDA and cast to float64 for numerical precision
         W_ = W.weight.to(device="cuda", dtype=torch.float64)
-        W.weight.data = torch.matmul(W_, R1).to(device="cpu", dtype=dtype)
+
+        # Apply rotation: W_rotated = W @ R1
+        rotated = torch.matmul(W_, R1)
+
+        # Move back to CPU and restore original dtype
+        W.weight.data = rotated.to(device="cpu", dtype=dtype)
 
 
 def rotate_attention_output(layer, R1) -> None:
-    # Rotate output matrix of the self-attention layer.
+    """
+    Applies the transpose of the rotation matrix R1 to the output projection
+    matrix of the self-attention layer (W_O) and its bias, effectively reversing
+    the earlier rotation applied to Q, K, V, and embeddings.
+
+    This ensures that the overall function of the model remains the same after
+    the initial R1 rotation, completing the similarity transformation:
+    Output = R1ᵀ · (Original_Transform · R1 · Input)
+
+    Args:
+        layer: A transformer layer (e.g., from LLaMA) that contains a self-attention module.
+        R1 (torch.Tensor): The same rotation matrix applied earlier to Q, K, V and embeddings.
+    """
+
+    # Extract the output projection (W_O) of the attention block
     W = layer.self_attn.o_proj
 
+    # Preserve the original data type (e.g., float16 or bfloat16)
     dtype = W.weight.data.dtype
+
+    # Move weight to CUDA and upcast to float64 for numerical precision
     W_ = W.weight.data.to(device="cuda", dtype=torch.float64)
-    W.weight.data = torch.matmul(R1.T, W_).to(device="cpu", dtype=dtype)
+
+    # Apply the inverse rotation (R1ᵀ @ W_O)
+    rotated_weight = torch.matmul(R1.T, W_)
+
+    # Move rotated weight back to CPU and cast back to original dtype
+    W.weight.data = rotated_weight.to(device="cpu", dtype=dtype)
+
+    # If a bias term exists for W_O, rotate it as well
     if W.bias is not None:
+        # Move bias to CUDA and upcast
         b = W.bias.data.to(device="cuda", dtype=torch.float64)
-        W.bias.data = torch.matmul(R1.T, b).to(device="cpu", dtype=dtype)
+
+        # Rotate bias using R1ᵀ (same as for weights)
+        rotated_bias = torch.matmul(R1.T, b)
+
+        # Cast and move back
+        W.bias.data = rotated_bias.to(device="cpu", dtype=dtype)
 
 
 def rotate_mlp_input(layer, R1):
-    # Rotate the MLP input weights.
+    """
+    Applies rotation matrix R1 to the input projection weights of the MLP (feed-forward) block
+    in a transformer layer. This includes `up_proj` and `gate_proj`.
+
+    This rotation transforms the input activations of the MLP block, aligning them with
+    the rotated embedding and attention space.
+
+    Args:
+        layer: A transformer layer containing an MLP block with `up_proj` and `gate_proj`.
+        R1 (torch.Tensor): The rotation matrix applied to embeddings and attention inputs.
+    """
+
+    # Get the input projection layers of the MLP
     mlp_inputs = [layer.mlp.up_proj, layer.mlp.gate_proj]
+
     for W in mlp_inputs:
+        # Store the original data type (bfloat16, float16, etc.)
         dtype = W.weight.dtype
+
+        # Move the weight to CUDA and upcast to float64 for stable matrix multiplication
         W_ = W.weight.data.to(device="cuda", dtype=torch.float64)
-        W.weight.data = torch.matmul(W_, R1).to(device="cpu", dtype=dtype)
+
+        # Apply the rotation matrix: W_rotated = W_original @ R1
+        rotated_weight = torch.matmul(W_, R1)
+
+        # Move the result back to CPU and convert to original dtype
+        W.weight.data = rotated_weight.to(device="cpu", dtype=dtype)
 
 
 def rotate_mlp_output(layer, R1):
-    # Rotate the MLP output weights and bias.
+    """
+    Applies the transpose of rotation matrix R1 to the output projection (down_proj) 
+    weights and bias of the MLP (feed-forward) block in a transformer layer.
+
+    This effectively reverses the earlier input-space rotation (by applying R1.T),
+    ensuring the output is mapped back to the original representation space.
+
+    Additionally, applies an exact inverse Hadamard transformation to the weights 
+    for improved quantization properties.
+
+    Args:
+        layer: A transformer layer containing an MLP block with `down_proj`.
+        R1 (torch.Tensor): The rotation matrix used for embedding and attention space alignment.
+    """
+
+    # Access the down projection layer of the MLP block
     W = layer.mlp.down_proj
+
+    # Store original data type (e.g., float16, bfloat16)
     dtype = W.weight.data.dtype
+
+    # Move the weights to CUDA and upcast to float64 for numerical stability
     W_ = W.weight.data.to(device="cuda", dtype=torch.float64)
+
+    # Apply inverse rotation: W_rotated = R1.T @ W_original
+    # This maps the rotated activations back to the original space
     W.weight.data = torch.matmul(R1.T, W_).to(device="cpu", dtype=dtype)
-    apply_exact_had_to_linear(
-        W, had_dim=-1, output=False
-    )  # apply exact (inverse) hadamard on the weights of mlp output
+
+    # Apply an exact Hadamard transformation on the output projection weights
+    # This prepares weights for Hadamard-aware quantization
+    apply_exact_had_to_linear(W, had_dim=-1, output=False)
+
+    # Rotate the bias term if it exists, same as the weights
     if W.bias is not None:
         b = W.bias.data.to(device="cuda", dtype=torch.float64)
         W.bias.data = torch.matmul(R1.T, b).to(device="cpu", dtype=dtype)
