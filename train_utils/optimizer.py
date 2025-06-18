@@ -39,14 +39,105 @@ def Cayley_loop(X, W, tan_vec, t):  #
     return Y.t()
 
 
-def qr_retraction(tan_vec):  # tan_vec, p-by-n, p <= n
+import torch
+
+# Small constant to avoid division by zero in normalization
+episilon = 1e-8
+
+
+def unit(v, dim: int = 1, eps: float = 1e-8):
+    """
+    Normalizes a 2D tensor along the specified dimension.
+
+    Args:
+        v (Tensor): Input tensor of shape (n, m).
+        dim (int): Dimension to normalize along. Default is 1 (columns).
+        eps (float): Small constant to avoid division by zero.
+
+    Returns:
+        Tuple[Tensor, Tensor]: Tuple of (normalized tensor, norms before normalization).
+    """
+    vnorm = norm(v, dim)             # Compute L2 norm along given dimension
+    return v / vnorm.add(eps), vnorm # Normalize and return both normalized vector and norms
+
+
+def norm(v, dim: int = 1):
+    """
+    Computes the L2 norm of a 2D tensor along a given dimension.
+
+    Args:
+        v (Tensor): Input 2D tensor.
+        dim (int): Dimension to reduce along.
+
+    Returns:
+        Tensor: Norms with dimensions preserved (keepdim=True).
+    """
+    assert len(v.size()) == 2, "Input tensor must be 2-dimensional"
+    return v.norm(p=2, dim=dim, keepdim=True)
+
+
+def matrix_norm_one(W):
+    """
+    Computes the matrix 1-norm (maximum absolute column sum).
+
+    Args:
+        W (Tensor): Input 2D matrix.
+
+    Returns:
+        Tensor: Scalar tensor representing the matrix 1-norm.
+    """
+    out = torch.abs(W)           # Take element-wise absolute value
+    out = torch.sum(out, dim=0)  # Sum across rows (i.e., column sums)
+    out = torch.max(out)         # Take the maximum column sum
+    return out
+
+
+def Cayley_loop(X, W, tan_vec, t):
+    """
+    Performs iterative Cayley retraction for Stiefel manifold optimization.
+
+    Cayley transform preserves orthogonality. The loop refines an update step
+    that moves `X` along a skew-symmetric direction `W`.
+
+    Args:
+        X (Tensor): Current orthonormal matrix of shape (n, p).
+        W (Tensor): Skew-symmetric update matrix of shape (n, n).
+        tan_vec (Tensor): Tangent vector (typically momentum) of shape (n, p).
+        t (float): Step size (learning rate scaled).
+
+    Returns:
+        Tensor: Transposed updated matrix of shape (p, n).
+    """
+    [n, p] = X.size()
+    Y = X + t * tan_vec  # Initial update guess
+
+    # Refine Y iteratively using midpoint formulation
+    for i in range(5):
+        Y = X + t * torch.matmul(W, 0.5 * (X + Y))
+
+    return Y.t()  # Return transposed result to match caller expectations
+
+
+def qr_retraction(tan_vec):
+    """
+    Projects the input matrix onto the Stiefel manifold using QR decomposition.
+
+    Args:
+        tan_vec (Tensor): Tangent vector matrix of shape (p, n), where p ≤ n.
+
+    Returns:
+        Tensor: Orthonormal matrix of shape (p, n) such that rows form an orthonormal set.
+    """
     [p, n] = tan_vec.size()
-    tan_vec.t_()
-    q, r = torch.linalg.qr(tan_vec)
-    d = torch.diag(r, 0)
-    ph = d.sign()
-    q *= ph.expand_as(q)
-    q.t_()
+    tan_vec.t_()  # Transpose to shape (n, p) for QR decomposition
+
+    q, r = torch.linalg.qr(tan_vec)  # QR decomposition
+
+    d = torch.diag(r, 0)             # Extract diagonal of R
+    ph = d.sign()                    # Compute sign of diagonal entries
+
+    q *= ph.expand_as(q)            # Adjust sign to ensure consistency
+    q.t_()                          # Transpose back to original shape (p, n)
 
     return q
 
@@ -133,7 +224,10 @@ class SGDG(Optimizer):
                 if p.grad is None:
                     continue
 
+                # Reshape weight matrix into 2D for processing
                 unity, _ = unit(p.data.view(p.size()[0], -1))
+
+                # Check whether Stiefel update is appropriate
                 if stiefel and unity.size()[0] <= unity.size()[1]:
                     weight_decay = group["weight_decay"]
                     dampening = group["dampening"]
@@ -157,14 +251,19 @@ class SGDG(Optimizer):
 
                     V = param_state["momentum_buffer"]
                     V = momentum * V - g.t()
+
+                    # Compute skew-symmetric update matrix
                     MX = torch.mm(V, unity)
                     XMX = torch.mm(unity, MX)
                     XXMX = torch.mm(unity.t(), XMX)
                     W_hat = MX - 0.5 * XXMX
                     W = W_hat - W_hat.t()
+
+                    # Compute Cayley step size
                     t = 0.5 * 2 / (matrix_norm_one(W) + episilon)
                     alpha = min(t, lr)
 
+                    # Cayley retraction update
                     p_new = Cayley_loop(unity.t(), W, V, alpha)
                     V_new = torch.mm(W, unity.t())  # n-by-p
                     #                     check_identity(p_new.t())
@@ -172,6 +271,8 @@ class SGDG(Optimizer):
                     V.copy_(V_new)
 
                 else:
+
+                    # Standard SGD update
                     d_p = p.grad.data
                     #  defined.
                     try:
@@ -193,7 +294,8 @@ class SGDG(Optimizer):
                             d_p = d_p.add(momentum, buf)
                         else:
                             d_p = buf
-
+                    
+                    # Standard SGD weight update
                     p.data.add_(-group["lr"], d_p)
 
         return loss
