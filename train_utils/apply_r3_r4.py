@@ -24,6 +24,9 @@ from utils.utils import HadamardTransform
 def R4_rotate_down_proj_weights(layer):
     # Rotate the MLP output weights and bias.
     W = layer.mlp.down_proj
+    # Apply the exact Hadamard transform to the weights of the down_proj layer.
+    # `had_dim=-1` indicates the transform is applied along the last dimension.
+    # `output=False` means the function modifies W in-place and doesn't return a new tensor.
     apply_exact_had_to_linear(
         W, had_dim=-1, output=False
     )  # apply exact (inverse) hadamard on the weights of mlp output
@@ -31,13 +34,28 @@ def R4_rotate_down_proj_weights(layer):
 
 @torch.inference_mode()
 def rotate_model(model, args):
+    """
+    Applies the R4 rotation (Hadamard-based transformation) to the down projection 
+    weights (W_down) of the MLP layers in the model.
+
+    Args:
+        model: The pre-trained transformer model whose MLP layers will be rotated.
+        args: Additional arguments, potentially containing rotation configs (not directly used here).
+    """
     config = model.config
+    
+    # Number of attention heads and model hidden dimension from the model's config
     num_heads = config.num_attention_heads
     model_dim = config.hidden_size
     head_dim = model_dim // num_heads
 
+    # Clean up unused GPU memory to prevent OOM issues before modifying model
     utils.cleanup_memory()
+
+    # Collect all transformer layers from the model
     layers = [layer for layer in model.model.layers]
+
+    # Apply R4 rotation to the down projection (W_down) weights in each layer
     for idx, layer in enumerate(
         tqdm.tqdm(layers, unit="layer", desc="Applying R4 rotation to W_down")
     ):
