@@ -142,12 +142,28 @@ def matmul_hadUt_cuda(X, hadK, K):
 
 
 def apply_exact_had_to_linear(module, had_dim=-1, output=False, R2=None):
+    """
+    Applies an exact Hadamard (or custom R2) transformation to a Linear module's weight matrix.
+
+    Depending on the mode (`output` flag), the transformation is applied along input or output features.
+
+    Args:
+        module (torch.nn.Linear): The linear layer whose weights will be transformed.
+        had_dim (int): Dimension along which Hadamard is applied. Must be power of 2. If -1, apply full-size Hadamard.
+        output (bool): If True, applies the transform along the output dimension (transposed weight).
+                       If False, applies along the input dimension.
+        R2 (Tensor, optional): If provided, uses this matrix instead of standard Hadamard.
+
+    Returns:
+        None: Modifies the weight of the linear layer in-place.
+    """
     assert isinstance(module, torch.nn.Linear)
     in_features, out_features = module.in_features, module.out_features
 
     if had_dim != -1:
         assert is_pow2(had_dim), "Hadamard dimension must be a power of 2!"
 
+    # Extract and store the original weight, dtype, and device
     W_ = module.weight.data
     dtype = W_.dtype
     dev = W_.device
